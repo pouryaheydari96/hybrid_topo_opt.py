@@ -1,207 +1,836 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+```notebook-python
+# -*- coding: utf-8 -*-
+"""
+Hybrid Topology Optimization - Final and Robust Code
+"""
 
-# C extensions
-*.so
+import os
+import sys
+import json
+import time
+from pathlib import Path
+from functools import lru_cache
+from datetime import datetime
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import spsolve, lsqr
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from matplotlib import pyplot as plt
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Check if running in a Google Colab or similar interactive environment
+try:
+    if 'google.colab' in sys.modules or 'ipykernel' in sys.modules:
+        print("Running in an interactive environment. Installing necessary dependencies...")
+        get_ipython().system('pip install --quiet matplotlib scipy numpy torch scikit-image')
+        print("Dependencies installed.")
+except NameError:
+    pass
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Ensure results directory exists
+RES_DIR = Path("./results")
+if not RES_DIR.exists():
+    RES_DIR.mkdir()
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+# === [1] Configuration Class ===
+class HybridConfig:
+    """
+    Configuration class for the entire hybrid topology optimization experiment.
+    All parameters are defined here for easy access and modification.
+    """
+    def __init__(self, problem_type="mbb", img_size=64):
+        self.problem_type = problem_type
+        self.img_size = img_size
+        self.vol_fraction = 0.3
+        self.E0 = 1.0
+        self.Emin = 1e-9
+        self.nu = 0.3
+        self.penalty = 3.0
+        self.classical_filter_radius = 2.0
+        self.classical_max_iter = 1000
+        self.classical_stop_threshold = 1e-3
+        self.oc_move = 0.2
 
-# Translations
-*.mo
-*.pot
+        # ML model and data parameters
+        self.ml_init_features = 16
+        self.ml_threshold = 0.5
+        self.ml_epochs = 50
+        self.ml_batch_size = 4
+        self.ml_lr = 1e-3
+        self.ml_weight_decay = 1e-5
+        self.gen_samples = 200  # Number of training samples to generate
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+        # Experiment metadata
+        self.experiment_name = f"topo_opt_{datetime.now().strftime('%Y%m%d')}_{self.img_size}x{self.img_size}"
+        self.debug_mode = True  # Set to True for fast, small runs
 
-# Flask stuff:
-instance/
-.webassets-cache
+        if self.debug_mode:
+            self.gen_samples = 3
+            self.ml_epochs = 2
+            self.ml_batch_size = 2
+            self.classical_max_iter = 50
 
-# Scrapy stuff:
-.scrapy
+        # Device configuration (auto-detects CUDA if available)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Sphinx documentation
-docs/_build/
+# === [2] Utility Functions ===
+def ensure_dirs_for_path(path):
+    """
+    Ensures that the directory for a given file path exists.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-# PyBuilder
-.pybuilder/
-target/
+# === [3] ML Model and Training ===
+class ConvBlock(nn.Module):
+    """
+    A basic convolutional block with two convolution layers, GroupNorm, and ReLU.
+    """
+    def __init__(self, in_features, out_features):
+        super(ConvBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_features, out_features, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_features, out_features, kernel_size=3, padding=1),
+            nn.GroupNorm(8, out_features),
+            nn.ReLU(inplace=True)
+        )
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    def forward(self, x):
+        return self.block(x)
 
-# IPython
-profile_default/
-ipython_config.py
+class EnhancedUNet(nn.Module):
+    """
+    An enhanced U-Net architecture for density prediction in topology optimization.
+    It uses a symmetric encoder-decoder structure with skip connections.
+    """
+    def __init__(self, init_features=16):
+        super(EnhancedUNet, self).__init__()
+        self.init_features = init_features
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+        # Encoder
+        self.encoder1 = ConvBlock(1, init_features)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = ConvBlock(init_features, init_features * 2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = ConvBlock(init_features * 2, init_features * 4)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+        # Bottleneck
+        self.bottleneck = ConvBlock(init_features * 4, init_features * 8)
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+        # Decoder
+        self.upconv3 = nn.ConvTranspose2d(init_features * 8, init_features * 4, kernel_size=2, stride=2)
+        self.decoder3 = ConvBlock((init_features * 4) * 2, init_features * 4)
+        self.upconv2 = nn.ConvTranspose2d(init_features * 4, init_features * 2, kernel_size=2, stride=2)
+        self.decoder2 = ConvBlock((init_features * 2) * 2, init_features * 2)
+        self.upconv1 = nn.ConvTranspose2d(init_features * 2, init_features, kernel_size=2, stride=2)
+        self.decoder1 = ConvBlock(init_features * 2, init_features)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+        # Output head
+        self.conv_head = nn.Conv2d(init_features, 1, kernel_size=1)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+    def forward(self, x):
+        # Encoder path
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+        # Bottleneck
+        bottleneck = self.bottleneck(self.pool3(enc3))
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+        # Decoder path with skip connections
+        dec3 = self.upconv3(bottleneck)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
 
-# SageMath parsed files
-*.sage.py
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+        # Final output
+        return self.conv_head(dec1)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+class DiceLoss(nn.Module):
+    """
+    A custom loss function based on the Dice coefficient for measuring
+    the overlap between predicted and ground-truth density maps.
+    """
+    def __init__(self, smooth=1e-6):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
 
-# Rope project settings
-.ropeproject
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        num = 2.0 * (probs * targets).sum() + self.smooth
+        den = (probs + targets).sum() + self.smooth
+        return 1.0 - (num / den)
 
-# mkdocs documentation
-/site
+# === [4] Classical Topology Optimization ===
+def lk_E0_nu(nu):
+    """
+    Element stiffness matrix for 2D plane stress.
+    """
+    E = 1.0
+    k = np.array([1/2-nu/6, 1/8+nu/8, -1/4-nu/12, -1/8+3*nu/8, -1/4+nu/12, -1/8-nu/8, nu/6, 1/8-3*nu/8])
+    return E/(1-nu**2)*np.array([[k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]],
+                                 [k[1], k[0], k[7], k[6], k[5], k[4], k[3], k[2]],
+                                 [k[2], k[7], k[0], k[5], k[6], k[3], k[4], k[1]],
+                                 [k[3], k[6], k[5], k[0], k[7], k[2], k[1], k[4]],
+                                 [k[4], k[5], k[6], k[7], k[0], k[1], k[2], k[3]],
+                                 [k[5], k[4], k[3], k[2], k[1], k[0], k[7], k[6]],
+                                 [k[6], k[3], k[4], k[1], k[2], k[7], k[0], k[5]],
+                                 [k[7], k[2], k[1], k[4], k[3], k[6], k[5], k[0]]])
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+def assemble_K(rho, cfg, edofMat):
+    """
+    Assembles the global stiffness matrix K using SIMP: E_i = Emin + rho_i^p (E0 - Emin)
+    """
+    nelem = rho.size
+    KE = lk_E0_nu(cfg.nu)  # KE for E=1 (8x8)
+    E = cfg.Emin + (rho**cfg.penalty) * (cfg.E0 - cfg.Emin)  # (nelem,)
 
-# Pyre type checker
-.pyre/
+    # Assembly indices (correct ordering)
+    iK = np.kron(edofMat, np.ones((8, 1))).T.flatten().astype(int)
+    jK = np.kron(edofMat, np.ones((1, 8))).flatten().astype(int)
 
-# pytype static type analyzer
-.pytype/
+    # Scale KE per element (align with iK/jK ordering)
+    # shape: (64, nelem) -> flatten column-major (F) to match kron pattern
+    sKe = KE.flatten()[:, None] * E[None, :]
+    sK = sKe.flatten(order='F')
 
-# Cython debug symbols
-cython_debug/
+    ndof = 2 * (cfg.img_size + 1) * (cfg.img_size + 1)
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+    # Guard against stray indices
+    valid = (iK < ndof) & (jK < ndof)
+    if not np.all(valid):
+        iK, jK, sK = iK[valid], jK[valid], sK[valid]
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+    K = coo_matrix((sK, (iK, jK)), shape=(ndof, ndof)).tocsr()
+    # symmetrize for numerical robustness
+    K = (K + K.T) * 0.5
+    return K
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+def fem_solve(K, F, fixed_dofs):
+    """
+    Solves the FEM equations K*U = F to find the displacement vector U.
+    """
+    ndofs = F.size
+    all_dofs = np.arange(ndofs)
+    free_dofs = np.setdiff1d(all_dofs, fixed_dofs)
 
-# Ruff stuff:
-.ruff_cache/
+    K_free = K[free_dofs, :][:, free_dofs]
+    F_free = F[free_dofs]
 
-# PyPI configuration file
-.pypirc
+    try:
+        U_free = spsolve(K_free, F_free)
+    except RuntimeError:
+        # Fallback to a more robust solver for ill-conditioned matrices
+        U_free, _, _, _ = lsqr(K_free, F_free)
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
+    U = np.zeros(ndofs)
+    U[free_dofs] = U_free
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+    return U
+
+@lru_cache(maxsize=None)
+def build_filter(img_size, filter_radius):
+    """
+    Builds the filter matrix for sensitivity filtering.
+    """
+    nely, nelx = img_size, img_size
+    I, J, S = [], [], []
+
+    for i in range(nelx * nely):
+        row = i // nelx
+        col = i % nelx
+
+        for r_offset in range(int(-filter_radius), int(filter_radius) + 1):
+            for c_offset in range(int(-filter_radius), int(filter_radius) + 1):
+                if r_offset**2 + c_offset**2 <= filter_radius**2:
+                    neighbor_row = row + r_offset
+                    neighbor_col = col + c_offset
+
+                    if 0 <= neighbor_row < nely and 0 <= neighbor_col < nelx:
+                        neighbor_index = neighbor_row * nelx + neighbor_col
+                        dist = np.sqrt(r_offset**2 + c_offset**2)
+                        weight = filter_radius - dist
+
+                        I.append(i)
+                        J.append(neighbor_index)
+                        S.append(weight)
+
+    return coo_matrix((S, (I, J)), shape=(nelx * nely, nelx * nely)).tocsr()
+
+def apply_filter(dC, rho, cfg):
+    """
+    Applies a density filter to the sensitivities.
+    """
+    filt = build_filter(cfg.img_size, cfg.classical_filter_radius)
+
+    # Convert to dense arrays for element-wise operations
+    divisor = np.array(filt.sum(axis=1)).flatten()
+    rho_flat = rho.flatten()
+
+    # Avoid division by zero
+    divisor[divisor == 0] = 1e-9
+    rho_flat[rho_flat == 0] = 1e-9
+
+    dC_flattened = dC.flatten() / (rho_flat * divisor)
+    dC_filt = filt.dot(dC_flattened)
+
+    return dC_filt.reshape(cfg.img_size, cfg.img_size)
+
+def oc_update(rho, dC, volfrac, oc_move):
+    """
+    Updates the densities using the Optimality Criteria method.
+    """
+    l1, l2 = 0.0, 1e9
+    rho_new = rho.copy()
+    while (l2 - l1) > 1e-4:
+        lmid = (l1 + l2) / 2
+        # Prevent NaN by clamping negative values
+        eta = np.sqrt(np.maximum(1e-16, -dC / lmid))
+        rho_tent = rho * eta
+        rho_new = np.clip(rho_tent, rho - oc_move, rho + oc_move)
+        rho_new = np.clip(rho_new, 0.001, 1.0)
+        if rho_new.mean() - volfrac > 0:
+            l1 = lmid
+        else:
+            l2 = lmid
+    return rho_new
+
+def enhanced_classical_optimization(initial_design, cfg):
+    nely, nelx = cfg.img_size, cfg.img_size
+    nelem = nely * nelx
+
+    # init rho
+    rho = np.clip(initial_design.astype(float), 0.001, 1.0)
+    rho *= cfg.vol_fraction / max(1e-9, rho.mean())
+
+    # node id helper (zero-based)
+    def nid(r, c):
+        return r * (nelx + 1) + c  # 0 <= r <= nely, 0 <= c <= nelx
+
+    # build edofMat (Q4, 8 dofs)
+    edofMat = np.zeros((nelem, 8), dtype=int)
+    for elx in range(nelx):
+        for ely in range(nely):
+            el = ely + elx * nely
+            n1 = nid(ely,     elx    )
+            n2 = nid(ely,     elx + 1)
+            n3 = nid(ely + 1, elx + 1)
+            n4 = nid(ely + 1, elx    )
+            edofMat[el, :] = np.array([
+                2*n1, 2*n1+1,
+                2*n2, 2*n2+1,
+                2*n3, 2*n3+1,
+                2*n4, 2*n4+1
+            ], dtype=int)
+
+    ndof = 2 * (nely + 1) * (nelx + 1)
+    F = np.zeros(ndof)
+    fixed_dofs = []
+
+    # ---- Boundary conditions per problem ----
+    if cfg.problem_type == "cantilever":
+        # load: middle of right edge, downward
+        fr = nely // 2
+        fc = nelx
+        fn = nid(fr, fc)
+        F[2*fn + 1] = -1.0  # y
+
+        # fixed: entire left edge (x=y=0)
+        for r in range(nely + 1):
+            n = nid(r, 0)
+            fixed_dofs.extend([2*n, 2*n + 1])
+
+    elif cfg.problem_type == "bridge":
+        # load: center top (downward)
+        fn = nid(nely, nelx // 2)
+        F[2*fn + 1] = -1.0
+
+        # supports: bottom corners
+        nL = nid(0, 0)
+        nR = nid(0, nelx)
+        fixed_dofs.extend([2*nL, 2*nL + 1])   # fully fixed left
+        fixed_dofs.extend([2*nR + 1])         # roller at right (y only)
+
+    elif cfg.problem_type == "mbb":
+        # classic MBB: load: top-left corner downward
+        fn = nid(nely, 0)
+        F[2*fn + 1] = -1.0
+
+        # supports: bottom-left fully fixed + bottom-right roller (y)
+        nBL = nid(0, 0)
+        nBR = nid(0, nelx)
+        fixed_dofs.extend([2*nBL, 2*nBL + 1])
+        fixed_dofs.extend([2*nBR + 1])
+
+    fixed_dofs = np.unique(np.array(fixed_dofs, dtype=int))
+
+    history = {"compliance": [], "true_compliance": [], "volume": [], "change": []}
+
+    for it in range(cfg.classical_max_iter):
+        K = assemble_K(rho.flatten(), cfg, edofMat)
+        U = fem_solve(K, F, fixed_dofs)
+
+        # elemental energy density w.r.t KE( E=1 )
+        KE = lk_E0_nu(cfg.nu)
+        Ue = U[edofMat]   # (nelem, 8)
+        ce0 = np.einsum("ni,ij,nj->n", Ue, KE, Ue)  # Ue^T KE Ue (per element for E=1)
+
+        # "true" compliance = sum( E_i * ce0_i )
+        E = cfg.Emin + (rho.flatten()**cfg.penalty) * (cfg.E0 - cfg.Emin)
+        C_true = float(np.dot(E, ce0))
+        # sensitivity (SIMP)
+        dC_drho = -cfg.penalty * (rho.flatten()**(cfg.penalty - 1)) * (cfg.E0 - cfg.Emin) * ce0
+        dC_filtered = apply_filter(dC_drho.reshape(nely, nelx), rho, cfg)
+
+        rho_old = rho.copy()
+        rho = oc_update(rho, dC_filtered, cfg.vol_fraction, cfg.oc_move)
+
+        change = np.max(np.abs(rho - rho_old))
+        history["compliance"].append(float(ce0.sum()))       # legacy metric
+        history["true_compliance"].append(C_true)            # important: real compliance
+        history["volume"].append(float(rho.mean()))
+        history["change"].append(float(change))
+
+        if it > 10 and change < cfg.classical_stop_threshold:
+            print(f"Classical optimization converged after {it} iterations.")
+            break
+
+        if (it % 10 == 0) or (it == cfg.classical_max_iter - 1):
+            print(f"Iter {it:03d} | VF={rho.mean():.3f} | Δ={change:.4f} | C_true={C_true:.4f}")
+
+    return rho, history
+
+# === [5] Data Generation and Pipeline ===
+def generate_training_data(cfg):
+    """
+    Generates training data by running classical TO on random initial designs.
+    """
+    print(f"Generating {cfg.gen_samples} training samples for {cfg.problem_type}...")
+
+    data_dir = Path(f"./data/{cfg.problem_type}")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    inputs, targets = [], []
+
+    for i in range(cfg.gen_samples):
+        try:
+            # Create random initial design with Gaussian smoothing
+            rho0 = np.clip(gaussian_filter(np.random.rand(cfg.img_size, cfg.img_size), sigma=1.0), 0.001, 1.0)
+
+            # Run classical optimization
+            refined_design, _ = enhanced_classical_optimization(rho0, cfg)
+
+            inputs.append(rho0)
+            targets.append(refined_design)
+
+            if (i+1) % 10 == 0:
+                print(f"  - Generated {i+1}/{cfg.gen_samples} samples.")
+
+        except Exception as e:
+            print(f"Error generating sample {i+1}: {str(e)}")
+            # Add some dummy data to prevent empty arrays
+            dummy_design = np.ones((cfg.img_size, cfg.img_size)) * 0.5
+            inputs.append(dummy_design)
+            targets.append(dummy_design)
+            continue
+
+    # Save data
+    np.save(data_dir / "inputs.npy", np.array(inputs))
+    np.save(data_dir / "targets.npy", np.array(targets))
+    print("Training data generation complete.")
+
+class TopoDataset(Dataset):
+    """
+    A PyTorch Dataset for loading topology optimization data.
+    """
+    def __init__(self, cfg):
+        self.cfg = cfg
+        data_path = Path(f"./data/{cfg.problem_type}/inputs.npy")
+        if not data_path.exists():
+            generate_training_data(cfg)
+
+        self.inputs = np.load(data_path)
+        self.targets = np.load(Path(f"./data/{cfg.problem_type}/targets.npy"))
+
+        # Check if arrays are empty and create dummy data if needed
+        if len(self.inputs.shape) == 1 or self.inputs.shape[0] == 0:
+            print("Warning: Input data is empty, creating dummy data.")
+            self.inputs = np.random.rand(10, cfg.img_size, cfg.img_size)
+            self.targets = np.random.rand(10, cfg.img_size, cfg.img_size)
+
+        # Add a channel dimension for PyTorch (N, C, H, W)
+        self.inputs = torch.from_numpy(self.inputs).float()
+        self.targets = torch.from_numpy(self.targets).float()
+
+        # Ensure correct shape
+        if len(self.inputs.shape) == 3:
+            self.inputs = self.inputs.unsqueeze(1)
+            self.targets = self.targets.unsqueeze(1)
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return self.inputs[idx], self.targets[idx]
+
+def train_ml_model(cfg):
+    """
+    Trains the EnhancedUNet model on the generated dataset.
+    """
+    print(f"Training ML model for {cfg.problem_type}...")
+
+    model = EnhancedUNet(init_features=cfg.ml_init_features).to(cfg.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.ml_lr, weight_decay=cfg.ml_weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+    bce_loss = nn.BCEWithLogitsLoss()
+    dice_loss = DiceLoss()
+
+    dataset = TopoDataset(cfg)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=cfg.ml_batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.ml_batch_size, shuffle=False)
+
+    history = {"train": [], "val": []}
+    best_loss = float('inf')
+
+    # Ensure directories exist before saving
+    model_dir = Path(f"./models/{cfg.experiment_name}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / f"{cfg.problem_type}_model.pth"
+
+    res_dir = Path(f"./results/{cfg.experiment_name}/{cfg.problem_type}")
+    res_dir.mkdir(parents=True, exist_ok=True)
+
+    scaler = torch.cuda.amp.GradScaler() if cfg.device.type == 'cuda' else None
+
+    for epoch in range(cfg.ml_epochs):
+        model.train()
+        train_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(cfg.device), targets.to(cfg.device)
+
+            optimizer.zero_grad()
+
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = 0.5 * bce_loss(outputs, targets) + 0.5 * dice_loss(outputs, targets)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = 0.5 * bce_loss(outputs, targets) + 0.5 * dice_loss(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(cfg.device), targets.to(cfg.device)
+                outputs = model(inputs)
+                loss = 0.5 * bce_loss(outputs, targets) + 0.5 * dice_loss(outputs, targets)
+                val_loss += loss.item()
+
+        avg_train_loss = train_loss / max(1, len(train_loader))
+        avg_val_loss = val_loss / max(1, len(val_loader))
+
+        history["train"].append(avg_train_loss)
+        history["val"].append(avg_val_loss)
+
+        print(f"Epoch {epoch+1}/{cfg.ml_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        scheduler.step(avg_val_loss)
+
+        if avg_val_loss < best_loss - 1e-4:
+            best_loss = avg_val_loss
+            torch.save(model.state_dict(), model_path)
+            print(f"  -> Best model saved with validation loss: {best_loss:.4f}")
+
+    np.save(res_dir / "training_history.npy", history)
+
+    # Plot training history
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train'], label='Train Loss')
+    plt.plot(history['val'], label='Validation Loss')
+    plt.title('ML Model Training History')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(res_dir / "training_history.png")
+    plt.close()
+
+    print("ML model training complete.")
+    return model
+
+def hybrid_topology_optimization(cfg, ml_model):
+    """
+    Executes the hybrid optimization pipeline.
+    """
+    print(f"\nRunning Hybrid Optimization for {cfg.problem_type}...")
+
+    # Ensure output directory exists
+    out_dir = Path(f"./results/{cfg.experiment_name}/{cfg.problem_type}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. ML-based initial design
+    start_time_ml = time.time()
+    initial_input = torch.ones(1, 1, cfg.img_size, cfg.img_size).to(cfg.device)
+
+    ml_model.eval()
+    with torch.no_grad():
+        logits = ml_model(initial_input)
+        sigma = torch.sigmoid(logits).cpu().numpy().squeeze()
+
+    ml_bin = (sigma > cfg.ml_threshold).astype(float)
+    ml_time = time.time() - start_time_ml
+
+    # 2. Classical refinement
+    start_time_cls = time.time()
+    refined_design, history = enhanced_classical_optimization(ml_bin, cfg)
+    cls_time = time.time() - start_time_cls
+
+    # 3. Visualization
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(sigma, cmap='viridis')
+    axes[0].set_title('ML Initial Design')
+    axes[0].set_axis_off()
+
+    axes[1].imshow(ml_bin, cmap='gray')
+    axes[1].set_title('ML Binarized Design')
+    axes[1].set_axis_off()
+
+    axes[2].imshow(refined_design, cmap='gray')
+    axes[2].set_title(f'Final Hybrid Result (VF={refined_design.mean():.3f})')
+    axes[2].set_axis_off()
+
+    plt.suptitle(f"Hybrid Optimization Result for {cfg.problem_type.title()} Problem")
+    plt.savefig(out_dir / "hybrid_final_result.png")
+    plt.close()
+
+    # 4. Save results
+    np.save(out_dir / "ml_initial_design.npy", sigma)
+    np.save(out_dir / "hybrid_final_result.npy", refined_design)
+
+    print("Hybrid optimization complete.")
+
+    return {
+        'initial_design': sigma,
+        'binary_design': ml_bin,
+        'final_design': refined_design,
+        'volume_fraction': refined_design.mean(),
+        'compliance_score': float(history.get('true_compliance', history['compliance'])[-1]),
+        'ml_inference_time': ml_time,
+        'classical_optimization_time': cls_time,
+    }
+
+# === [6] Analysis and Reporting ===
+def evaluate_design_quality(design, cfg):
+    """
+    Evaluates key quality metrics of a design.
+    """
+    try:
+        from skimage.morphology import label
+    except ImportError:
+        print("scikit-image not found. Installing...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-image"])
+        from skimage.morphology import label
+
+    vf = np.mean(design)
+
+    # Connectivity: size of the largest connected component
+    labeled_design = label(design > 0.5)
+    component_sizes = np.bincount(labeled_design.ravel())
+    if len(component_sizes) > 1:
+        connectivity = np.max(component_sizes[1:]) / (np.sum(component_sizes[1:]) + 1e-9)
+    else:
+        connectivity = 0.0
+
+    # Proxy-compliance (lower is better): sum of edge weights
+    comp_proxy = np.sum(np.abs(np.diff(design, axis=0))) + np.sum(np.abs(np.diff(design, axis=1)))
+
+    # Overall quality score (higher is better)
+    quality_score = 0.4 * (1 - vf) + 0.4 * connectivity + 0.2 * (1 - comp_proxy/np.max(design))
+
+    return {
+        'volume_fraction': vf,
+        'connectivity': connectivity,
+        'compliance': comp_proxy,
+        'quality_score': quality_score
+    }
+
+def analyze_results(results, cfg):
+    """
+    Analyzes and reports the final results of the experiment.
+    """
+    print("\n--- Final Analysis ---")
+
+    initial_metrics = evaluate_design_quality(results['binary_design'], cfg)
+    final_metrics = evaluate_design_quality(results['final_design'], cfg)
+
+    report = {
+        'initial_metrics': initial_metrics,
+        'final_metrics': final_metrics,
+        'time_metrics': {
+            'ml_inference_time': results['ml_inference_time'],
+            'classical_optimization_time': results['classical_optimization_time'],
+        },
+        'improvement_metrics': {
+            'volume_improvement': (initial_metrics['volume_fraction'] - final_metrics['volume_fraction']) / max(initial_metrics['volume_fraction'], 1e-9),
+            'connectivity_improvement': (final_metrics['connectivity'] - initial_metrics['connectivity']) / max(initial_metrics['connectivity'], 1e-9),
+            'compliance_improvement': (initial_metrics['compliance'] - final_metrics['compliance']) / max(initial_metrics['compliance'], 1e-9),
+            'quality_improvement': (final_metrics['quality_score'] - initial_metrics['quality_score']) / max(initial_metrics['quality_score'], 1e-9),
+        }
+    }
+
+    # Ensure directory exists before saving
+    out_dir = Path(f"./results/{cfg.experiment_name}/{cfg.problem_type}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "analysis_report.json"
+
+    with open(report_path, 'w') as f:
+        json.dump(report, f, indent=4)
+
+    print(f"Analysis report saved to: {report_path}")
+
+    # Plot analysis summary
+    metrics_labels = ['Volume', 'Connectivity', 'Proxy-Compliance', 'Quality Score']
+    initial_values = [initial_metrics['volume_fraction'], initial_metrics['connectivity'], initial_metrics['compliance'], initial_metrics['quality_score']]
+    final_values = [final_metrics['volume_fraction'], final_metrics['connectivity'], final_metrics['compliance'], final_metrics['quality_score']]
+
+    improvements = [report['improvement_metrics']['volume_improvement'],
+                    report['improvement_metrics']['connectivity_improvement'],
+                    report['improvement_metrics']['compliance_improvement'],
+                    report['improvement_metrics']['quality_improvement']]
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Bar chart for initial vs final metrics
+    x = np.arange(len(metrics_labels))
+    width = 0.35
+    axes[0].bar(x - width/2, initial_values, width, label='Initial (ML)')
+    axes[0].bar(x + width/2, final_values, width, label='Final (Hybrid)')
+    axes[0].set_ylabel('Score')
+    axes[0].set_title('Performance Metrics: Initial vs. Final')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(metrics_labels)
+    axes[0].legend()
+
+    # Bar chart for % improvement
+    axes[1].bar(x, improvements)
+    axes[1].set_ylabel('% Improvement')
+    axes[1].set_title('Percentage Improvement')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(metrics_labels)
+    axes[1].axhline(0, color='red', linestyle='--')
+
+    plt.suptitle(f"Analysis Summary for {cfg.problem_type.title()} Problem")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(out_dir / "analysis_summary.png")
+    plt.close()
+
+    print("Analysis summary image saved.")
+
+    return report
+
+# === [7] Sanity Check & Experiment Runner ===
+def quick_sanity_check():
+    """
+    Quick sanity check for the classical optimization part.
+    """
+    cfg = HybridConfig(problem_type="cantilever", img_size=16)
+    rho0 = np.clip(np.random.rand(cfg.img_size, cfg.img_size), 0.1, 0.9)
+    rho, hist = enhanced_classical_optimization(rho0, cfg)
+    print("K iterations:", len(hist["volume"]), " final VF:", np.mean(rho))
+    return len(hist["volume"]) > 0 and np.mean(rho) > 0
+
+def run_full_experiment():
+    """
+    Run the full hybrid topology optimization pipeline across multiple problems.
+    Trains the ML model, runs hybrid optimization, analyzes results, and saves a summary.
+    """
+    # You can adjust this list as needed
+    problem_list = ["cantilever", "bridge", "mbb"]
+    all_results = {}
+    start_time_exp = time.time()
+
+    print("=== Starting Full Hybrid Topology Optimization Experiment ===")
+
+    for stage, prob in enumerate(problem_list, start=1):
+        print(f"\n--- Stage {stage}/{len(problem_list)}: {prob.title()} Problem ---")
+
+        # Config for each problem (use img_size=32 for speed; 64 for higher fidelity)
+        cfg = HybridConfig(problem_type=prob, img_size=32)
+
+        # Ensure base paths
+        ensure_dirs_for_path(f"./models/{cfg.experiment_name}/{prob}_model.pth")
+        ensure_dirs_for_path(f"./results/{cfg.experiment_name}/{prob}/analysis_report.json")
+
+        # 1) Train the ML model
+        print("[1/3] Training ML model...")
+        ml_model = train_ml_model(cfg)
+
+        # 2) Run hybrid optimization
+        print("[2/3] Running hybrid optimization...")
+        results = hybrid_topology_optimization(cfg, ml_model)
+
+        # 3) Analyze results and save report
+        print("[3/3] Analyzing results...")
+        report = analyze_results(results, cfg)
+
+        # Summary per problem
+        all_results[prob] = {
+            "final_volume_fraction": float(results["volume_fraction"]),
+            "true_compliance": float(results["compliance_score"]),
+            "quality_score": float(report["final_metrics"]["quality_score"]),
+            "ml_inference_time": float(results["ml_inference_time"]),
+            "classical_time": float(results["classical_optimization_time"]),
+        }
+
+    total_time = time.time() - start_time_exp
+
+    # Save global summary
+    summary_dir = Path(f"./results/{cfg.experiment_name}")
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(summary_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    print("\n=== Experiment Completed ===")
+    print(f"Total experiment time: {total_time:.2f} seconds.")
+    print(f"Full summary saved to: {summary_path}")
+
+    return all_results
+
+# === [8] Main ===
+if __name__ == "__main__":
+    # Run quick sanity check first
+    if quick_sanity_check():
+        print("Sanity check passed. Running full experiment...")
+        run_full_experiment()
+    else:
+        print("Sanity check failed. Please check the implementation.")
+```
